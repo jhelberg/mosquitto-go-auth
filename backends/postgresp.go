@@ -12,15 +12,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-//Postgres holds all fields of the postgres db connection.
+//Postgresp holds all fields of the postgresp db configuration.
 type Postgresp struct {
 	Host           string
 	Port           string
 	DBName         string
-	User           string
-	Password       string
 	UserQuery      string
-	SuperuserQuery string
 	AclQuery       string
 	PAclQuery      string
 	SSLMode        string
