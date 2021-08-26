@@ -32,6 +32,7 @@ type Backends struct {
 
 const (
 	// backends
+	postgrespBackend = "postgresp"
 	postgresBackend = "postgres"
 	jwtBackend      = "jwt"
 	redisBackend    = "redis"
@@ -55,6 +56,7 @@ const (
 
 // AllowedBackendsOptsPrefix serves as a check for allowed backends and a map from backend to expected opts prefix.
 var allowedBackendsOptsPrefix = map[string]string{
+	postgrespBackend: "pgp",
 	postgresBackend: "pg",
 	jwtBackend:      "jwt",
 	redisBackend:    "redis",
@@ -131,6 +133,14 @@ func (b *Backends) addBackends(authOpts map[string]string, logLevel log.Level, b
 			} else {
 				log.Infof("backend registered: %s", beIface.GetName())
 				b.backends[postgresBackend] = beIface.(Postgres)
+			}
+		case postgrespBackend:
+			beIface, err = NewPostgresp(authOpts, logLevel )
+			if err != nil {
+				log.Fatalf("backend register error: couldn't initialize %s backend with error %s.", bename, err)
+			} else {
+				log.Infof("backend registered: %s", beIface.GetName())
+				b.backends[postgrespBackend] = beIface.(Postgresp)
 			}
 		case jwtBackend:
 			beIface, err = NewJWT(authOpts, logLevel, hasher, version)
