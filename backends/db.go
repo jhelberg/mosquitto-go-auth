@@ -1,8 +1,8 @@
 package backends
 
 import (
-	"fmt"
-	"time"
+	//"fmt"
+	//"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
@@ -19,27 +19,10 @@ func OpenDatabase(dsn, engine string, tries int) (*sqlx.DB, error) {
 		return nil, errors.Wrap(err, "database connection error")
 	}
 
-	if tries == 0 {
-		tries = 1
+	if err = db.Ping(); err != nil {
+		log.Errorf("ping database %s error: %s", engine, err)
+		db.Close()
+		return nil, err
 	}
-
-	for tries != 0 {
-		if err = db.Ping(); err != nil {
-			log.Errorf("ping database %s error, will retry in 2s: %s", engine, err)
-			time.Sleep(2 * time.Second)
-		} else {
-			break
-		}
-
-		if tries > 0 {
-			tries--
-		}
-	}
-
-	// Return last ping error when done trying.
-	if tries == 0 {
-		return nil, fmt.Errorf("couldn't ping database %s: %s", engine, err)
-	}
-
 	return db, nil
 }
