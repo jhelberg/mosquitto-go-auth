@@ -45,6 +45,21 @@ var	userpasss = make( map[ string ]string )
 // if so, we protect userpasss by a RWMutex. If not, too bad, some cycles are lost.
 var     passaccessmutex = sync.RWMutex{}
 
+func openDatabase(dsn, engine string, tries int) (*sqlx.DB, error) {
+
+	db, err := sqlx.Open(engine, dsn)
+	if err != nil {
+		return nil, errors.Wrap(err, "database connection error")
+	}
+
+	if err = db.Ping(); err != nil {
+		log.Errorf("ping database %s error: %s", engine, err)
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 func NewPostgresp(authOpts map[string]string, logLevel log.Level ) (Postgresp, error) {
 	log.SetLevel(logLevel)
 
@@ -118,16 +133,16 @@ func NewPostgresp(authOpts map[string]string, logLevel log.Level ) (Postgresp, e
 	return postgres, nil
 }
 
-//GetUser checks that the username exists and the given password hashes to the same password.
+//GetUser checks that the username can login with the given credentials
 func (o Postgresp) GetUser(username, password, clientid string) (bool, error) {
 
 	connStr := o.connectString( username, password, o.SSLCert != "" || o.SSLKey != "" )
-	DB, err := OpenDatabase(connStr, "postgres", o.connectTries)
+	DB, err := openDatabase(connStr, "postgres", o.connectTries)
 	if err == nil {
 		passaccessmutex.Lock()
 		// strings are immutable in Go, except... when they come from a C program, the bytes in password
 		// are re-used later by the C program, hence the copying of the content of the string.
-		userpasss[ username ] = password[0:1] + password[1:] // simplest way to copy string contents
+		userpasss[ username[0:1] + username[1:] ] = password[0:1] + password[1:] // simplest way to copy string contents
 		passaccessmutex.Unlock()
 		DB.Close()
 		return true, nil
@@ -171,7 +186,7 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 		passaccessmutex.Unlock()
 		var err error
 		log.Debugf("PGP CheckAcl client %s using %s", clientid, username )
-		DB, err = OpenDatabase( o.connectString( username, p, o.SSLCert != "" || o.SSLKey != "" ), "postgres", o.connectTries )
+		DB, err = openDatabase( o.connectString( username, p, o.SSLCert != "" || o.SSLKey != "" ), "postgres", o.connectTries )
 		if err != nil {
 			log.Debugf("PGP CheckAcl logon error from client %s: user %s not valid", clientid, username)
 			return false, err
