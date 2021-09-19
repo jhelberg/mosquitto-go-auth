@@ -40,6 +40,9 @@ import (
 // result in a hashmap with 50k entries, the size of this hashmap will
 // hardly be more than a few megabytes.
 
+// TODO: remove database connection for every user once in a while to make
+//       sure this user is still allowed to connect. Configurable and
+//       defaults to 20 minutes or so.
 // TODO: hash the password, as it may leak and is inspectable by root
 // TODO: re-connect in case a query fails because of a disconnect from the
 //       other side. 2 seconds back-off time seems reasonable, but will
@@ -63,9 +66,8 @@ type Postgresp struct {
 }
 
 // we store a map username -> dbconnection for not re-connecting all
-// the time. This is not implemented yet!
-// Note that connections are cleaned up after a while by timed-functions
-// hence the mutex.
+// the time. It has limited size, beyond this, re-connects will
+// happen all the time for new users.
 var	userconns = make( map[ string ]*sqlx.DB )
 var     connsaccessmutex = sync.RWMutex{}
 
@@ -86,7 +88,7 @@ var     passaccessmutex = sync.RWMutex{}
 // this user cannot play.
 var chit = 0
 var nopens = 0
-func openDatabase(dsn, engine string) (*sqlx.DB, error) {
+func (o Postgresp) openDatabase(dsn, engine string) (*sqlx.DB, error) {
 	nopens++
 	connsaccessmutex.Lock()
 	if db, ok := userconns[ dsn ]; ok {
@@ -107,7 +109,7 @@ func openDatabase(dsn, engine string) (*sqlx.DB, error) {
 		db.Close()
 		return nil, err
 	}
-	if len( userconns ) < 3  {
+	if len( userconns ) < o.CCS  {
 		connsaccessmutex.Lock()
 		userconns[ dsn ] = db
 		connsaccessmutex.Unlock()
@@ -116,7 +118,7 @@ func openDatabase(dsn, engine string) (*sqlx.DB, error) {
 	}
 	return db, nil
 }
-func closeDatabase(dsn string, db *sqlx.DB) {
+func (o Postgresp) closeDatabase(dsn string, db *sqlx.DB) {
 	connsaccessmutex.Lock()
 	if _, ok := userconns[ dsn ]; !ok {
 		connsaccessmutex.Unlock()
@@ -214,9 +216,9 @@ func NewPostgresp(authOpts map[string]string, logLevel log.Level ) (Postgresp, e
 func (o Postgresp) GetUser(username, password, clientid string) (bool, error) {
 
 	connStr := o.connectString( username, password, o.SSLCert != "" || o.SSLKey != "" )
-	DB, err := openDatabase(connStr, "postgres")
-	closeDatabase(connStr, DB)
-	if err == nil {
+	DB, err := o.openDatabase(connStr, "postgres")
+	o.closeDatabase(connStr, DB)
+	if err == nil { // only cache username/password in case connecting succeeds
 		passaccessmutex.Lock()
 		// strings are immutable in Go, except... when they come from a C program, the bytes in password
 		// are re-used later by the C program, hence the copying of the content of the string.
@@ -265,10 +267,13 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 		var err error
 		log.Debugf("PGP CheckAcl client %s using %s", clientid, username )
 		connstring = o.connectString( username, p, o.SSLCert != "" || o.SSLKey != "" )
-		DB, err = openDatabase( connstring, "postgres")
+		DB, err = o.openDatabase( connstring, "postgres")
 		if err != nil {
 			log.Debugf("PGP CheckAcl logon error from client %s: user %s not valid", clientid, username)
-			closeDatabase( connstring, DB )
+			passaccessmutex.Lock()
+			delete( userpasss, username )
+			passaccessmutex.Unlock()
+			o.closeDatabase( connstring, DB )
 			return false, err
 		}
 	} else {
@@ -282,7 +287,7 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 		var ok bool
 
 		err := DB.Select(&ok, o.PAclQuery, username, acc, topic)
-		closeDatabase( connstring, DB )
+		o.closeDatabase( connstring, DB )
 
 		if err != nil {
 			log.Debugf("PGP check pacl error: %s", err)
@@ -295,7 +300,7 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 		var acls []string
 
 		err := DB.Select(&acls, o.AclQuery, username, acc)
-		closeDatabase( connstring, DB )
+		o.closeDatabase( connstring, DB )
 
 		if err != nil {
 			log.Debugf("PGP check acl error: %s", err)
