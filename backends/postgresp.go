@@ -2,6 +2,7 @@ package backends
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
         "sync"
 
@@ -11,6 +12,40 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
+
+// This is the postgres-personal edition of the postgresql backend.
+// The difference between the postgres and postgresp backend is that
+// the postgresp code uses the credentials of the mosquitto-user
+// to authenticate against the database and to run the ACL-queries
+// under this login-user as well.
+
+// This allows a fully Row-Level-Security data-set to function whithout
+// any need for super-users (hence the option for the query to check
+// for someone being 'the' super-user is removed)
+
+// The postgres-backend used the OpenDatabase-call for opening a
+// connection, assuming this happens only once and must succeed. The
+// whole retry-mechanism is dropped for the postgresp-backend, as
+// opening a new connection happens all the time and queries may not succeed
+// for some end-users, where it may still work for others. Hence no retries
+// and no disconnects upon failed queries.
+
+// The assumption is that there may be many mosquitto-end-users, but
+// that few make a lot of calls. Hence we cache some (configurable) amount
+// of database connections based upon the connection-string.
+// Also, as the context of accessing the ACL has no password available,
+// username/passwords are cached as well upon verifying if a user exists.
+// All username/passwords are cached in memory, allowing the mosquitto process
+// to grow a lot. Mind though that although 50000 different end-users will
+// result in a hashmap with 50k entries, the size of this hashmap will
+// hardly be more than a few megabytes.
+
+// TODO: hash the password, as it may leak and is inspectable by root
+// TODO: re-connect in case a query fails because of a disconnect from the
+//       other side. 2 seconds back-off time seems reasonable, but will
+//       block other procesing of messages. Maybe some go-routine should
+//       handle processing the failed call, queing these while handling the
+//       re-connect.
 
 //Postgresp holds all fields of the postgresp db configuration.
 type Postgresp struct {
@@ -24,8 +59,7 @@ type Postgresp struct {
 	SSLCert        string
 	SSLKey         string
 	SSLRootCert    string
-
-	connectTries int
+	CCS            int
 }
 
 // we store a map username -> dbconnection for not re-connecting all
@@ -45,8 +79,24 @@ var	userpasss = make( map[ string ]string )
 // if so, we protect userpasss by a RWMutex. If not, too bad, some cycles are lost.
 var     passaccessmutex = sync.RWMutex{}
 
-func openDatabase(dsn, engine string, tries int) (*sqlx.DB, error) {
-
+// postgresp maintains it's own opendatabase-call as the original one
+// retries connecting if it fails.
+// as we use end-user credentials (different for each end-user of the mosquitto product),
+// failing can be quite normal and is just an error, nothing fatal. It just means
+// this user cannot play.
+var chit = 0
+var nopens = 0
+func openDatabase(dsn, engine string) (*sqlx.DB, error) {
+	nopens++
+	connsaccessmutex.Lock()
+	if db, ok := userconns[ dsn ]; ok {
+		connsaccessmutex.Unlock()
+		chit++
+		log.Printf( "(postgresp:openDatabase) userconns hit: %d/%d", chit, nopens )
+		return db, nil
+	}
+	connsaccessmutex.Unlock()
+	log.Printf( "(postgresp:openDatabase) opening database connection" )
 	db, err := sqlx.Open(engine, dsn)
 	if err != nil {
 		return nil, errors.Wrap(err, "database connection error")
@@ -57,7 +107,25 @@ func openDatabase(dsn, engine string, tries int) (*sqlx.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if len( userconns ) < 3  {
+		connsaccessmutex.Lock()
+		userconns[ dsn ] = db
+		connsaccessmutex.Unlock()
+	} else {
+		log.Printf( "(postgresp:openDatabase) userconns permanent no-hit as len is %d", len( userconns ) )
+	}
 	return db, nil
+}
+func closeDatabase(dsn string, db *sqlx.DB) {
+	connsaccessmutex.Lock()
+	if _, ok := userconns[ dsn ]; !ok {
+		connsaccessmutex.Unlock()
+		if db != nil {
+			db.Close()
+		}
+	} else {
+		connsaccessmutex.Unlock()
+	}
 }
 
 func NewPostgresp(authOpts map[string]string, logLevel log.Level ) (Postgresp, error) {
@@ -74,7 +142,7 @@ func NewPostgresp(authOpts map[string]string, logLevel log.Level ) (Postgresp, e
 		SSLMode:        "disable",
 		AclQuery:       "",
 		PAclQuery:      "",
-		connectTries:   -1,
+		CCS:            50,
 	}
 
 	if host, ok := authOpts["pg_host"]; ok {
@@ -125,6 +193,15 @@ func NewPostgresp(authOpts map[string]string, logLevel log.Level ) (Postgresp, e
 		postgres.SSLCert = sslCert
 	}
 
+	if ccs, ok := authOpts["pgp_conncachesize"]; ok {
+		cachesize, err := strconv.Atoi( ccs )
+		if err != nil {
+			log.Warnf("invalid postgres connection cache size options: %s", err)
+		} else {
+			postgres.CCS = cachesize
+		}
+	}
+
 	//Exit if any mandatory option is missing.
 	if !pgOk {
 		return postgres, errors.Errorf("PGP backend error: missing options: %s", missingOptions)
@@ -137,14 +214,14 @@ func NewPostgresp(authOpts map[string]string, logLevel log.Level ) (Postgresp, e
 func (o Postgresp) GetUser(username, password, clientid string) (bool, error) {
 
 	connStr := o.connectString( username, password, o.SSLCert != "" || o.SSLKey != "" )
-	DB, err := openDatabase(connStr, "postgres", o.connectTries)
+	DB, err := openDatabase(connStr, "postgres")
+	closeDatabase(connStr, DB)
 	if err == nil {
 		passaccessmutex.Lock()
 		// strings are immutable in Go, except... when they come from a C program, the bytes in password
 		// are re-used later by the C program, hence the copying of the content of the string.
 		userpasss[ username[0:1] + username[1:] ] = password[0:1] + password[1:] // simplest way to copy string contents
 		passaccessmutex.Unlock()
-		DB.Close()
 		return true, nil
 	} else {
 		log.Debugf("PGP GetUser logon error from client %s: user %s not valid", clientid, username)
@@ -181,14 +258,17 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 		return true, nil
 	}
 	var DB *sqlx.DB
+	connstring := ""
 	passaccessmutex.Lock()
 	if p, ok := userpasss[ username ]; ok {
 		passaccessmutex.Unlock()
 		var err error
 		log.Debugf("PGP CheckAcl client %s using %s", clientid, username )
-		DB, err = openDatabase( o.connectString( username, p, o.SSLCert != "" || o.SSLKey != "" ), "postgres", o.connectTries )
+		connstring = o.connectString( username, p, o.SSLCert != "" || o.SSLKey != "" )
+		DB, err = openDatabase( connstring, "postgres")
 		if err != nil {
 			log.Debugf("PGP CheckAcl logon error from client %s: user %s not valid", clientid, username)
+			closeDatabase( connstring, DB )
 			return false, err
 		}
 	} else {
@@ -197,18 +277,17 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 		return false, nil
 	}
 
+	// one of AclQuery and PAclQuery is not empty (see first if in this function)
 	if o.PAclQuery != "" {
 		var ok bool
 
 		err := DB.Select(&ok, o.PAclQuery, username, acc, topic)
+		closeDatabase( connstring, DB )
 
 		if err != nil {
 			log.Debugf("PGP check pacl error: %s", err)
-			DB.Close()
 			return false, err
 		}
-
-		DB.Close()
 		return ok, nil
 	}
 
@@ -216,14 +295,13 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 		var acls []string
 
 		err := DB.Select(&acls, o.AclQuery, username, acc)
+		closeDatabase( connstring, DB )
 
 		if err != nil {
 			log.Debugf("PGP check acl error: %s", err)
-			DB.Close()
 			return false, err
 		}
 
-		DB.Close()
 		for _, acl := range acls {
 			aclTopic := strings.Replace(acl, "%c", clientid, -1)
 			aclTopic = strings.Replace(aclTopic, "%u", username, -1)
@@ -231,9 +309,10 @@ func (o Postgresp) CheckAcl(username, topic, clientid string, acc int32) (bool, 
 				return true, nil
 			}
 		}
+		return false, nil
         }
+	// not reached
 	return false, nil
-
 }
 
 //GetName returns the backend's name
